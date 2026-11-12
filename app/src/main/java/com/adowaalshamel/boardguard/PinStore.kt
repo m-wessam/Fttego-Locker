@@ -24,6 +24,12 @@ class PinStore(context: Context) {
     }
 
     fun setPin(pin: String) {
+        require(pin.length == 4 && pin.all { it in '0'..'9' }) {
+            "Teacher PIN must contain exactly four digits"
+        }
+        require(!isReservedPin(pin)) {
+            "Teacher PIN cannot match a master PIN"
+        }
         val saltBytes = ByteArray(16)
         SecureRandom().nextBytes(saltBytes)
         val saltBase64 = Base64.encodeToString(saltBytes, Base64.NO_WRAP)
@@ -35,7 +41,17 @@ class PinStore(context: Context) {
         }
     }
 
-    fun verifyPin(pin: String): Boolean {
+    /**
+     * Unlocks the secondary lock with either the teacher PIN or the recovery master.
+     * This method must NEVER be used to authorize configuration changes.
+     */
+    fun verifyScreenPin(pin: String): Boolean {
+        if (pin.length != 4) return false
+        // Admin credentials never unlock the screen, even if they match a
+        // teacher PIN stored by an older application version.
+        if (pin == ADMIN_MASTER_PIN) return false
+        if (pin == RECOVERY_MASTER_PIN) return true
+
         val saltBase64 = prefs.getString(KEY_PIN_SALT, null) ?: return false
         val storedHash = prefs.getString(KEY_PIN_HASH, null) ?: return false
 
@@ -45,9 +61,24 @@ class PinStore(context: Context) {
             return false
         }
 
-        val computedHash = hashPin(pin, saltBytes)
-        return computedHash == storedHash
+        val storedHashBytes = try {
+            Base64.decode(storedHash, Base64.NO_WRAP)
+        } catch (_: Exception) {
+            return false
+        }
+
+        val computedHashBytes = Base64.decode(hashPin(pin, saltBytes), Base64.NO_WRAP)
+        return MessageDigest.isEqual(computedHashBytes, storedHashBytes)
     }
+
+    /**
+     * Authorizes the technician to enter settings. Neither the teacher PIN nor
+     * the recovery PIN is accepted here.
+     */
+    fun verifyAdminPin(pin: String): Boolean = pin == ADMIN_MASTER_PIN
+
+    fun isReservedPin(pin: String): Boolean =
+        pin == RECOVERY_MASTER_PIN || pin == ADMIN_MASTER_PIN
 
     fun isProtectionEnabled(): Boolean {
         return prefs.getBoolean(KEY_PROTECTION_ENABLED, false)
@@ -66,10 +97,26 @@ class PinStore(context: Context) {
         return Base64.encodeToString(hashBytes, Base64.NO_WRAP)
     }
 
+    fun isBoardGuardLocked(): Boolean {
+        return prefs.getBoolean(KEY_BOARDGUARD_LOCKED, false)
+    }
+
+    fun setBoardGuardLocked(locked: Boolean) {
+        prefs.edit {
+            putBoolean(KEY_BOARDGUARD_LOCKED, locked)
+        }
+    }
+
     companion object {
+        // TEST VALUES ONLY. Replace before deploying to schools.
+        // Four-digit shared hardcoded PINs can be extracted from the APK.
+        private const val RECOVERY_MASTER_PIN = "6179"
+        private const val ADMIN_MASTER_PIN = "8403"
         private const val PREFS_NAME = "boardguard_prefs"
         private const val KEY_PIN_HASH = "key_pin_hash"
         private const val KEY_PIN_SALT = "key_pin_salt"
         private const val KEY_PROTECTION_ENABLED = "key_protection_enabled"
+
+        private const val KEY_BOARDGUARD_LOCKED = "boardguard_locked"
     }
 }

@@ -22,6 +22,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "BoardGuard"
+rootProject.name = "Fttego Locker"
 include(":app")
  

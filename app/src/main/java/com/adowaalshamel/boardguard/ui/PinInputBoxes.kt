@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -24,7 +25,10 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
@@ -32,8 +36,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /**
- * Reusable 4-digit PIN input component featuring four distinct boxes with
- * auto-advancing focus, backspace handling, masked characters, and error state styling.
+ * Reusable 4-digit PIN input component featuring four distinct boxes
+ * with focus handling, backspace support, masked characters,
+ * error state styling, and keyboard dismissal on Done.
  */
 @Composable
 fun PinInputBoxes(
@@ -45,20 +50,50 @@ fun PinInputBoxes(
     boxSpacing: Dp = 12.dp,
     useSoftKeyboard: Boolean = true
 ) {
-    val hiddenTextFieldFocusRequester = remember { FocusRequester() }
-    var isTextFieldFocused by remember { mutableStateOf(false) }
 
-    // Display row of 4 boxes
-    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+    val hiddenTextFieldFocusRequester = remember {
+        FocusRequester()
+    }
+
+    var isTextFieldFocused by remember {
+        mutableStateOf(false)
+    }
+
+    val keyboardController = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
+
+    Box(
+        modifier = modifier,
+        contentAlignment = Alignment.Center
+    ) {
+
         if (useSoftKeyboard) {
-            // Invisible BasicTextField to handle software keyboard input seamlessly
+
+            // Invisible TextField for handling numeric keyboard input
             BasicTextField(
                 value = pinValue,
+
                 onValueChange = { newValue ->
-                    val filtered = newValue.filter { it.isDigit() }.take(4)
+                    val filtered = newValue
+                        .filter { it.isDigit() }
+                        .take(4)
+
                     onPinChange(filtered)
                 },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.NumberPassword,
+                    imeAction = ImeAction.Done
+                ),
+
+                // Hide the keyboard when the Done button is pressed
+                keyboardActions = KeyboardActions(
+                    onDone = {
+                        keyboardController?.hide()
+                        focusManager.clearFocus()
+                    }
+                ),
+
                 modifier = Modifier
                     .focusRequester(hiddenTextFieldFocusRequester)
                     .onFocusChanged { focusState ->
@@ -68,13 +103,20 @@ fun PinInputBoxes(
             )
         }
 
+        // Display four PIN boxes
         Row(
             horizontalArrangement = Arrangement.spacedBy(boxSpacing),
             verticalAlignment = Alignment.CenterVertically
         ) {
+
             for (index in 0 until 4) {
+
                 val digit = pinValue.getOrNull(index)
-                val isCurrentBoxTarget = pinValue.length == index || (pinValue.length == 4 && index == 3)
+
+                val isCurrentBoxTarget =
+                    pinValue.length == index ||
+                            (pinValue.length == 4 && index == 3)
+
                 val isFocused = if (useSoftKeyboard) {
                     isTextFieldFocused && isCurrentBoxTarget
                 } else {
@@ -98,7 +140,11 @@ fun PinInputBoxes(
                         .clip(RoundedCornerShape(12.dp))
                         .background(backgroundColor)
                         .border(
-                            width = if (isFocused || isError) 2.dp else 1.dp,
+                            width = if (isFocused || isError) {
+                                2.dp
+                            } else {
+                                1.dp
+                            },
                             color = borderColor,
                             shape = RoundedCornerShape(12.dp)
                         )
@@ -107,13 +153,19 @@ fun PinInputBoxes(
                                 hiddenTextFieldFocusRequester.requestFocus()
                             }
                         },
+
                     contentAlignment = Alignment.Center
                 ) {
+
                     Text(
                         text = if (digit != null) "•" else "",
                         fontSize = 28.sp,
                         fontWeight = FontWeight.Bold,
-                        color = if (isError) MaterialTheme.colorScheme.error else Color.Black,
+                        color = if (isError) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            Color.Black
+                        },
                         textAlign = TextAlign.Center
                     )
                 }

@@ -1,12 +1,15 @@
 package com.adowaalshamel.boardguard
 
+import android.app.ActivityManager
+import android.app.admin.DevicePolicyManager
 import android.os.Bundle
+import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -20,9 +23,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -44,8 +45,8 @@ import com.adowaalshamel.boardguard.ui.PinInputBoxes
 import com.adowaalshamel.boardguard.ui.theme.BoardGuardTheme
 
 /**
- * Full-screen secondary lock Activity running inside Android Lock Task Mode.
- * Requires the correct 4-digit BoardGuard PIN to dismiss.
+ * Full-screen secondary lock Activity.
+ * Only a valid BoardGuard PIN clears the persisted lock state.
  */
 class LockActivity : ComponentActivity() {
 
@@ -54,62 +55,128 @@ class LockActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        isLockActive = true
         pinStore = PinStore(this)
+        isLockActive = true
 
-        // Prevent screenshots / recents preview
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
 
-        // Ensure Lock Task Mode is configured & started if Device Owner
-        if (BoardGuardDeviceAdminReceiver.isDeviceOwner(this)) {
-            BoardGuardDeviceAdminReceiver.setupLockTaskMode(this)
-            try {
-                startLockTask()
-            } catch (e: Exception) {
-                // Defensive fallback if lock task fails
-            }
+        if (!pinStore.isBoardGuardLocked()) {
+            Log.w(TAG, "LockActivity opened while persisted lock state is false; closing")
+            isLockActive = false
+            finishAndRemoveTask()
+            return
         }
+
+        BoardGuardDeviceAdminReceiver.setupLockTaskMode(this)
+        ensureLockTaskMode()
 
         setContent {
             BoardGuardTheme {
                 LockScreenContent(
-                    onUnlockSuccess = {
-                        unlockAndExit()
-                    },
-                    verifyPin = { pin ->
-                        pinStore.verifyPin(pin)
-                    }
+                    onUnlockSuccess = { unlockAndExit() },
+                    verifyPin = { pin -> pinStore.verifyScreenPin(pin) }
                 )
             }
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        isLockActive = true
+    }
+
     override fun onResume() {
         super.onResume()
         isLockActive = true
-        if (BoardGuardDeviceAdminReceiver.isDeviceOwner(this)) {
-            try {
-                startLockTask()
-            } catch (_: Exception) {
-            }
+        ensureLockTaskMode()
+    }
+
+    override fun onStop() {
+        isLockActive = false
+
+        if (::pinStore.isInitialized && pinStore.isBoardGuardLocked()) {
+            Log.w(TAG, "LOCK_ACTIVITY_STOPPED_WHILE_LOCKED")
+            ensureMonitorServiceRunning()
         }
+
+        super.onStop()
     }
 
     override fun onDestroy() {
         isLockActive = false
+
+        if (::pinStore.isInitialized && pinStore.isBoardGuardLocked()) {
+            Log.w(TAG, "LOCK_ACTIVITY_DESTROYED_WHILE_LOCKED")
+            ensureMonitorServiceRunning()
+        }
+
         super.onDestroy()
     }
 
+    private fun ensureLockTaskMode() {
+        if (!BoardGuardDeviceAdminReceiver.isDeviceOwner(this)) {
+            Log.e(TAG, "Cannot enter Lock Task Mode because app is not Device Owner")
+            return
+        }
+
+        try {
+            BoardGuardDeviceAdminReceiver.setupLockTaskMode(this)
+
+            val dpm = getSystemService(DevicePolicyManager::class.java)
+            val activityManager = getSystemService(ActivityManager::class.java)
+
+            if (
+                dpm.isLockTaskPermitted(packageName) &&
+                activityManager.lockTaskModeState == ActivityManager.LOCK_TASK_MODE_NONE
+            ) {
+                startLockTask()
+            }
+
+            Log.i(
+                TAG,
+                "LOCK_TASK_STATE=${lockTaskStateName(activityManager.lockTaskModeState)}"
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Unable to enter Lock Task Mode", e)
+        }
+    }
+
     private fun unlockAndExit() {
+        pinStore.setBoardGuardLocked(false)
+        Log.i(TAG, "BOARDGUARD_UNLOCKED_BY_VALID_PIN")
+
         try {
             stopLockTask()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.w(TAG, "stopLockTask failed or Lock Task Mode was already stopped", e)
         }
+
         isLockActive = false
-        finish()
+        finishAndRemoveTask()
+    }
+
+    private fun ensureMonitorServiceRunning() {
+        try {
+            if (pinStore.hasPin() && pinStore.isProtectionEnabled()) {
+                ScreenMonitorService.startService(this)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to ensure ScreenMonitorService is running", e)
+        }
+    }
+
+    private fun lockTaskStateName(state: Int): String {
+        return when (state) {
+            ActivityManager.LOCK_TASK_MODE_LOCKED -> "LOCKED"
+            ActivityManager.LOCK_TASK_MODE_PINNED -> "PINNED"
+            ActivityManager.LOCK_TASK_MODE_NONE -> "NONE"
+            else -> state.toString()
+        }
     }
 
     companion object {
+        private const val TAG = "BoardGuardLock"
+
         @Volatile
         var isLockActive: Boolean = false
     }
@@ -153,29 +220,7 @@ private fun LockScreenContent(
                         .fillMaxWidth()
                         .padding(vertical = 32.dp, horizontal = 24.dp)
                 ) {
-                    // Shield Icon
-                    Box(
-                        modifier = Modifier
-                            .size(64.dp)
-                            .clip(CircleShape)
-                            .background(Color(0xFF1E88E5)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "🛡",
-                            fontSize = 32.sp,
-                            color = Color.White
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    Text(
-                        text = stringResource(R.string.app_name),
-                        fontSize = 26.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFF1A1C1E)
-                    )
+                    Image(painterResource(R.drawable.fttego_logo), contentDescription = "")
 
                     Spacer(modifier = Modifier.height(6.dp))
 
