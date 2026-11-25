@@ -4,9 +4,10 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.util.Log
+import java.io.IOException
 
 /**
- * Restarts Fttego Locker monitoring after boot when protection is enabled.
+ * Restarts monitoring and backend synchronization, including before the first PIN.
  */
 class BootReceiver : BroadcastReceiver() {
 
@@ -18,29 +19,28 @@ class BootReceiver : BroadcastReceiver() {
 
         Log.i(TAG, "Locker restart event: $action")
 
+        if (!BoardGuardDeviceAdminReceiver.isDeviceOwner(context)) return
+
         val pinStore = PinStore(context)
 
         // Only a real boot begins a new lock cycle. App updates must keep the
         // existing lock state and immediately restore the monitoring service.
         if (action == Intent.ACTION_BOOT_COMPLETED) {
-            pinStore.setBoardGuardLocked(false)
+            try {
+                pinStore.setBoardGuardLocked(false)
+            } catch (_: IOException) {
+                Log.e(TAG, "Unable to persist the boot session; keeping cached protection")
+            }
         }
 
-        if (
-            pinStore.hasPin() &&
-            pinStore.isProtectionEnabled() &&
-            BoardGuardDeviceAdminReceiver.isDeviceOwner(context)
-        ) {
-            Log.i(TAG, "Protection enabled, starting post-boot lock flow")
+        try {
             if (action == Intent.ACTION_BOOT_COMPLETED) {
                 ScreenMonitorService.startServiceAfterBoot(context)
             } else {
-                try {
-                    ScreenMonitorService.startService(context)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Unable to restart monitoring after app update", e)
-                }
+                ScreenMonitorService.startService(context)
             }
+        } catch (_: RuntimeException) {
+            Log.e(TAG, "Unable to restart screen monitoring")
         }
     }
 

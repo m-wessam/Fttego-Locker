@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.util.Log
 import com.adowaalshamel.boardguard.BoardGuardDeviceAdminReceiver
 import com.adowaalshamel.boardguard.BuildConfig
+import com.adowaalshamel.boardguard.PinStore
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
@@ -23,7 +24,7 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 
-/** A check is started only when the user opens the application's Settings entry screen. */
+/** A check is started only when the user opens the application's information page. */
 sealed interface UpdateUiState {
     data object Hidden : UpdateUiState
     data object Checking : UpdateUiState
@@ -64,7 +65,7 @@ object AppUpdateController {
         ) return
 
         // This feature is intended for an already provisioned screen only.
-        if (!BoardGuardDeviceAdminReceiver.isDeviceOwner(context)) {
+        if (!BoardGuardDeviceAdminReceiver.isDeviceOwner(context) || PinStore(context).isBoardGuardLocked()) {
             mutableState.value = UpdateUiState.Hidden
             return
         }
@@ -97,6 +98,7 @@ object AppUpdateController {
     suspend fun install(context: Context, release: LockerRelease) {
         val current = mutableState.value
         if (current is UpdateUiState.Downloading || current is UpdateUiState.Installing) return
+        if (PinStore(context).isBoardGuardLocked()) return
 
         lastAttemptedRelease = release
         mutableState.value = UpdateUiState.Downloading(0)
@@ -109,9 +111,12 @@ object AppUpdateController {
                 require(release.versionCode > BuildConfig.VERSION_CODE.toLong()) {
                     "This version is already installed."
                 }
+                requireUnlocked(context)
 
                 downloadedApk = downloadApk(context, release.apkUrl)
                 verifyApk(context, downloadedApk, release.versionCode)
+                currentCoroutineContext().ensureActive()
+                requireUnlocked(context)
                 mutableState.value = UpdateUiState.Installing
                 commitUpdate(context, downloadedApk)
                 // The result is delivered to UpdateInstallReceiver. A successful
@@ -292,6 +297,7 @@ object AppUpdateController {
     }
 
     private fun commitUpdate(context: Context, apk: File) {
+        requireUnlocked(context)
         val installer = context.packageManager.packageInstaller
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
             .apply {
@@ -316,12 +322,18 @@ object AppUpdateController {
                     callback,
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
                 ).intentSender
+                // Copying a large APK into the install session can overlap a new lock.
+                requireUnlocked(context)
                 session.commit(sender)
                 committed = true
             }
         } finally {
             if (!committed) runCatching { installer.abandonSession(sessionId) }
         }
+    }
+
+    private fun requireUnlocked(context: Context) {
+        check(!PinStore(context).isBoardGuardLocked()) { "Unlock the screen before updating the app" }
     }
 
     private fun openHttpsConnection(url: String): HttpURLConnection {
@@ -381,6 +393,8 @@ object AppUpdateController {
             host.equals("release-assets.githubusercontent.com", ignoreCase = true)
 
     private fun friendlyError(error: Exception): String = when {
+        error.message == "Unlock the screen before updating the app" ->
+            "Unlock the screen before updating the app."
         error is java.net.UnknownHostException ->
             "No internet connection. Connect to Wi-Fi and try again."
         error is java.net.SocketTimeoutException ->

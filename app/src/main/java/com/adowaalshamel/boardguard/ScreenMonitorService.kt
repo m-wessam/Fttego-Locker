@@ -10,6 +10,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -19,6 +22,15 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.adowaalshamel.boardguard.backend.LockerRuntime
+import java.io.IOException
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 /**
  * Foreground service that monitors Riotouch lock events and Android unlock events.
@@ -29,7 +41,25 @@ class ScreenMonitorService : Service() {
 
     private var isReceiverRegistered = false
     private lateinit var pinStore: PinStore
+    private lateinit var runtime: LockerRuntime
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var syncJob: Job? = null
+    private var serviceRunning = false
+    private var networkCallbackRegistered = false
+    private var nextSyncElapsed = 0L
+    private val policyPoll = Runnable { requestPolicySync("poll") }
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            mainHandler.post { requestPolicySync("network_available") }
+        }
+
+        override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+            if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                mainHandler.post { requestPolicySync("network_validated") }
+            }
+        }
+    }
 
     @Volatile
     private var pendingSystemUnlock = false
@@ -92,10 +122,12 @@ class ScreenMonitorService : Service() {
 
                 Intent.ACTION_SCREEN_OFF -> {
                     pendingSystemUnlock = true
+                    mainHandler.removeCallbacks(policyPoll)
                     Log.d(TAG, "SCREEN_OFF -> waiting for next system unlock")
                 }
 
                 Intent.ACTION_SCREEN_ON -> {
+                    requestPolicySync("screen_on")
                     val keyguardManager =
                         context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
                     val isLocked = keyguardManager?.isKeyguardLocked == true
@@ -111,6 +143,7 @@ class ScreenMonitorService : Service() {
                 }
 
                 Intent.ACTION_USER_PRESENT -> {
+                    requestPolicySync("user_present")
                     cancelPostBootFallback("android_user_present")
                     Log.d(TAG, "USER_PRESENT -> pendingSystemUnlock=$pendingSystemUnlock")
                     handleUserPresent(context)
@@ -121,7 +154,8 @@ class ScreenMonitorService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        pinStore = PinStore(this)
+        runtime = LockerRuntime.get(this)
+        pinStore = runtime.pinStore
 
         val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
         if (keyguardManager?.isKeyguardLocked == true) {
@@ -130,16 +164,23 @@ class ScreenMonitorService : Service() {
         }
 
         registerUnlockReceiver()
+        registerNetworkCallback()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForegroundServiceNotification()
 
-        if (!pinStore.isProtectionEnabled() || !pinStore.hasPin()) {
-            Log.i(TAG, "Protection disabled or PIN missing, stopping service")
+        if (!BoardGuardDeviceAdminReceiver.isDeviceOwner(this)) {
+            Log.i(TAG, "Monitoring requires Device Owner")
+            serviceRunning = false
             stopSelf()
             return START_NOT_STICKY
         }
+
+        // Stay alive before the first PIN and while protection is disabled so that
+        // enrollment, the first password and later policy changes can reach the screen.
+        serviceRunning = true
+        requestPolicySync("service_start")
 
         if (pinStore.isBoardGuardLocked()) {
             scheduleRelaunch("service_start", 400L)
@@ -164,6 +205,9 @@ class ScreenMonitorService : Service() {
     }
 
     override fun onDestroy() {
+        serviceRunning = false
+        serviceScope.cancel()
+        unregisterNetworkCallback()
         unregisterUnlockReceiver()
         cancelPostBootFallback("service_destroyed")
         mainHandler.removeCallbacksAndMessages(null)
@@ -172,6 +216,71 @@ class ScreenMonitorService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun registerNetworkCallback() {
+        val manager = getSystemService(ConnectivityManager::class.java) ?: return
+        try {
+            manager.registerDefaultNetworkCallback(networkCallback)
+            networkCallbackRegistered = true
+        } catch (_: RuntimeException) {
+            // Periodic and wake-up synchronization remain available.
+            Log.w(TAG, "Unable to observe network changes")
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        if (!networkCallbackRegistered) return
+        try {
+            getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(networkCallback)
+        } catch (_: RuntimeException) {
+            Log.w(TAG, "Unable to unregister network observer")
+        }
+        networkCallbackRegistered = false
+    }
+
+    private fun requestPolicySync(reason: String) {
+        if (!serviceRunning || syncJob?.isActive == true) return
+        mainHandler.removeCallbacks(policyPoll)
+        if (SystemClock.elapsedRealtime() < nextSyncElapsed) {
+            scheduleNextPolicySync()
+            return
+        }
+
+        syncJob = serviceScope.launch {
+            try {
+                val result = runtime.synchronize()
+                val retrySeconds = result.retryAfterSeconds ?: 0L
+                // Avoid overflow for a malformed, exceptionally large Retry-After.
+                val retryMillis = retrySeconds.coerceIn(0L, Long.MAX_VALUE / 2000L) * 1000L
+                nextSyncElapsed = SystemClock.elapsedRealtime() + retryMillis
+                // The store remains authoritative even when synchronization fails:
+                // a failed write may have switched it to its protective locked state.
+                // A valid first PIN arms the lock; later PIN changes preserve its session.
+                if (pinStore.isBoardGuardLocked() && pinStore.isProtectionEnabled()) {
+                    if (!LockActivity.isLockActive) launchLockActivity(this@ScreenMonitorService)
+                }
+                if (!result.synchronized) {
+                    Log.d(TAG, "Policy synchronization deferred: ${result.failure}, trigger=$reason")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // Never log an HTTP response, password, signed activation or token.
+                Log.w(TAG, "Unable to synchronize screen policy")
+            } finally {
+                scheduleNextPolicySync()
+            }
+        }
+    }
+
+    private fun scheduleNextPolicySync() {
+        mainHandler.removeCallbacks(policyPoll)
+        if (!serviceRunning) return
+        val powerManager = getSystemService(PowerManager::class.java) ?: return
+        if (!powerManager.isInteractive) return
+        val delayMillis = maxOf(POLICY_POLL_INTERVAL_MS, nextSyncElapsed - SystemClock.elapsedRealtime())
+        mainHandler.postDelayed(policyPoll, delayMillis)
+    }
 
     private fun registerUnlockReceiver() {
         if (isReceiverRegistered) return
@@ -304,9 +413,14 @@ class ScreenMonitorService : Service() {
             return
         }
 
-        if (!pinStore.isBoardGuardLocked()) {
+        try {
+            // Every real primary/system unlock starts a new lock cycle. A late HTTP
+            // verification from the preceding cycle must not clear this one.
             pinStore.setBoardGuardLocked(true)
             Log.i(TAG, "BOARDGUARD_LOCK_ARMED reason=$reason")
+        } catch (_: IOException) {
+            // PinStore fails closed in memory if its durable write fails.
+            Log.e(TAG, "Unable to persist the new lock session; keeping screen locked")
         }
 
         if (LockActivity.isLockActive) {
@@ -367,7 +481,7 @@ class ScreenMonitorService : Service() {
 
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.app_name))
-            .setContentText(getString(R.string.protection_active_notification))
+            .setContentText(getString(R.string.locker_monitor_notification))
             .setSmallIcon(R.mipmap.ic_launcher_round)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
@@ -401,6 +515,7 @@ class ScreenMonitorService : Service() {
         private const val TAG = "ScreenMonitorService"
         private const val CHANNEL_ID = "boardguard_service_channel"
         private const val NOTIFICATION_ID = 1001
+        private const val POLICY_POLL_INTERVAL_MS = 10_000L
 
         private const val ACTION_START_AFTER_BOOT =
             "com.adowaalshamel.boardguard.action.START_AFTER_BOOT"

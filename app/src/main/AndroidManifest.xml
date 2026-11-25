@@ -7,6 +7,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />
 
@@ -19,13 +20,12 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.BoardGuard">
-        <!--   Main Configuration & Settings Activity   -->
+        <!-- App information and user-requested updates; settings remain in the installer. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
-            android:theme="@style/Theme.BoardGuard"
-            android:windowSoftInputMode="adjustResize">
+            android:theme="@style/Theme.BoardGuard">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -39,6 +39,12 @@
             android:launchMode="singleInstance"
             android:showWhenLocked="false"
             android:theme="@style/Theme.BoardGuard" />
+        <!-- Public-key enrollment only; call() accepts the trusted ADB shell/root UID. -->
+        <provider
+            android:name=".enrollment.LockerEnrollmentProvider"
+            android:authorities="${applicationId}.enrollment"
+            android:exported="true"
+            android:grantUriPermissions="false" />
         <!--   Screen Unlock Monitor Foreground Service   -->
         <service
             android:name=".ScreenMonitorService"
@@ -47,7 +53,7 @@
             android:stopWithTask="false">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Monitors screen unlock events to enforce board guard protection" />
+                android:value="Monitors screen unlock events and synchronizes the device lock policy" />
         </service>
         <!--   Device Admin Receiver   -->
         <receiver

@@ -1,122 +1,154 @@
 package com.adowaalshamel.boardguard
 
 import android.content.Context
-import android.content.SharedPreferences
-import android.util.Base64
-import androidx.core.content.edit
-import java.security.MessageDigest
-import java.security.SecureRandom
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import android.util.AtomicFile
+import com.adowaalshamel.boardguard.backend.LockerCredentials
+import com.adowaalshamel.boardguard.storage.LockerSnapshot
+import com.adowaalshamel.boardguard.storage.LockerSnapshotCipher
+import com.adowaalshamel.boardguard.storage.PinDigest
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.security.KeyStore
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
 
-/**
- * Manages PIN persistence, salted SHA-256 password hashing,
- * and protection status flags using SharedPreferences.
- */
+/** Screen credentials, coherent server cache and local lock session in one encrypted file. */
 class PinStore(context: Context) {
+    private val file = AtomicFile(File(context.applicationContext.noBackupFilesDir, FILE_NAME))
+    private val cacheKey = file.baseFile.absolutePath
 
-    private val prefs: SharedPreferences = context.applicationContext.getSharedPreferences(
-        PREFS_NAME,
-        Context.MODE_PRIVATE
-    )
+    fun hasPin(): Boolean = synchronized(storeLock) { state().let { it.hasPin || it.storageFailure } }
+    fun isProtectionEnabled(): Boolean = synchronized(storeLock) { state().let { it.lockEnabled || it.storageFailure } }
+    fun isBoardGuardLocked(): Boolean = synchronized(storeLock) { state().let { it.boardLocked || it.storageFailure } }
+    fun hasCachedPolicy(): Boolean = synchronized(storeLock) { state().let { it.cachedPolicy && !it.storageFailure } }
+    fun getRevision(): String? = synchronized(storeLock) { state().takeIf { it.cachedPolicy && !it.storageFailure }?.revision }
+    fun getLockGeneration(): Long = synchronized(storeLock) { state().lockGeneration }
+    fun isOfflineUnlockAllowed(): Boolean = synchronized(storeLock) { state().canUnlockOffline }
 
-    fun hasPin(): Boolean {
-        return !prefs.getString(KEY_PIN_HASH, null).isNullOrEmpty() &&
-                !prefs.getString(KEY_PIN_SALT, null).isNullOrEmpty()
+    /** Called once per new vendor lock event, not for watchdog/activity relaunches. */
+    fun setBoardGuardLocked(locked: Boolean) = synchronized(storeLock) {
+        val current = state()
+        if (!locked && current.storageFailure) throw IOException("LOCKER_STORAGE_UNAVAILABLE")
+        commit(current.withBoardLocked(locked))
     }
 
-    fun setPin(pin: String) {
-        require(pin.length == 4 && pin.all { it in '0'..'9' }) {
-            "Teacher PIN must contain exactly four digits"
-        }
-        require(!isReservedPin(pin)) {
-            "Teacher PIN cannot match a master PIN"
-        }
-        val saltBytes = ByteArray(16)
-        SecureRandom().nextBytes(saltBytes)
-        val saltBase64 = Base64.encodeToString(saltBytes, Base64.NO_WRAP)
-        val hashBase64 = hashPin(pin, saltBytes)
-
-        prefs.edit {
-            putString(KEY_PIN_SALT, saltBase64)
-            putString(KEY_PIN_HASH, hashBase64)
-        }
+    /** Returns true only for the first ever assigned PIN; a later PIN keeps the current session. */
+    fun cachePolicy(revision: String, lockEnabled: Boolean, password: String?): Boolean = synchronized(storeLock) {
+        val current = state()
+        val firstPassword = password != null && !current.everPinAssigned
+        commit(current.withPolicy(revision, lockEnabled, password))
+        firstPassword
     }
 
-    /**
-     * Unlocks the secondary lock with either the teacher PIN or the recovery master.
-     * This method must NEVER be used to authorize configuration changes.
-     */
-    fun verifyScreenPin(pin: String): Boolean {
-        if (pin.length != 4) return false
-        // Admin credentials never unlock the screen, even if they match a
-        // teacher PIN stored by an older application version.
-        if (pin == ADMIN_MASTER_PIN) return false
-        if (pin == RECOVERY_MASTER_PIN) return true
+    fun verifyCachedPin(pin: String): Boolean = synchronized(storeLock) {
+        val current = state()
+        current.canUnlockOffline && current.remainingBlockSeconds(System.currentTimeMillis()) == 0L &&
+            PinDigest.matches(pin, current.pinSalt, current.pinHash)
+    }
 
-        val saltBase64 = prefs.getString(KEY_PIN_SALT, null) ?: return false
-        val storedHash = prefs.getString(KEY_PIN_HASH, null) ?: return false
+    fun remainingBlockSeconds(nowMillis: Long = System.currentTimeMillis()): Long = synchronized(storeLock) {
+        state().remainingBlockSeconds(nowMillis)
+    }
 
-        val saltBytes = try {
-            Base64.decode(saltBase64, Base64.NO_WRAP)
+    fun recordFailedAttempt(nowMillis: Long = System.currentTimeMillis()): Long = synchronized(storeLock) {
+        val updated = state().withFailedAttempt(nowMillis)
+        commit(updated)
+        updated.remainingBlockSeconds(nowMillis)
+    }
+
+    /** An old network reply cannot open a newer vendor lock session. */
+    fun recordSuccessfulAttempt(expectedGeneration: Long): Boolean = synchronized(storeLock) {
+        val updated = state().afterSuccessfulAttempt(expectedGeneration) ?: return@synchronized false
+        commit(updated)
+        true
+    }
+
+    fun blockAttempts(seconds: Long) = synchronized(storeLock) {
+        commit(state().withBlock(seconds, System.currentTimeMillis()))
+    }
+
+    fun markServerAuthRejected() = synchronized(storeLock) {
+        commit(state().copy(offlineAllowed = false))
+    }
+
+    fun loadCredentials(): LockerCredentials? = synchronized(storeLock) { state().credentials }
+
+    fun saveCredentials(credentials: LockerCredentials) = synchronized(storeLock) {
+        require(credentials.deviceId.isNotBlank() && credentials.deviceId.length <= 512) { "DEVICE_ID_INVALID" }
+        require(credentials.deviceToken.isNotBlank() && credentials.deviceToken.length <= 8_192) { "DEVICE_TOKEN_INVALID" }
+        commit(state().copy(credentials = credentials))
+    }
+
+    fun clearCredentials() = synchronized(storeLock) {
+        commit(state().copy(credentials = null, offlineAllowed = false))
+    }
+
+    private fun state(): LockerSnapshot {
+        sharedStates[cacheKey]?.let { return it }
+        val base = file.baseFile
+        val exists = base.exists() || File(base.path + ".bak").exists() || File(base.path + ".new").exists()
+        val loaded = if (!exists) LockerSnapshot() else try {
+            val bytes = file.openRead().use { it.readNBytes(LockerSnapshotCipher.MAX_FILE_BYTES + 1) }
+            LockerSnapshotCipher.decrypt(bytes, encryptionKey(create = false))
         } catch (_: Exception) {
-            return false
+            // A lost key or unreadable prior cache must never turn a configured screen into
+            // an unconfigured/unlocked one. Only a successful server resync recovers this.
+            LockerSnapshot().failClosed()
         }
+        sharedStates[cacheKey] = loaded
+        return loaded
+    }
 
-        val storedHashBytes = try {
-            Base64.decode(storedHash, Base64.NO_WRAP)
+    private fun commit(updated: LockerSnapshot) {
+        val current = state()
+        if (updated == current) return
+        var stream: FileOutputStream? = null
+        try {
+            val encrypted = LockerSnapshotCipher.encrypt(updated, encryptionKey(create = true))
+            stream = file.startWrite()
+            stream.write(encrypted)
+            stream.fd.sync()
+            file.finishWrite(stream)
+            stream = null
+            // AtomicFile can log a rename failure without throwing. Confirm the exact commit
+            // before acknowledging a changed policy, credentials or successful unlock.
+            if (!file.readFully().contentEquals(encrypted)) throw IOException()
+            sharedStates[cacheKey] = updated
         } catch (_: Exception) {
-            return false
-        }
-
-        val computedHashBytes = Base64.decode(hashPin(pin, saltBytes), Base64.NO_WRAP)
-        return MessageDigest.isEqual(computedHashBytes, storedHashBytes)
-    }
-
-    /**
-     * Authorizes the technician to enter settings. Neither the teacher PIN nor
-     * the recovery PIN is accepted here.
-     */
-    fun verifyAdminPin(pin: String): Boolean = pin == ADMIN_MASTER_PIN
-
-    fun isReservedPin(pin: String): Boolean =
-        pin == RECOVERY_MASTER_PIN || pin == ADMIN_MASTER_PIN
-
-    fun isProtectionEnabled(): Boolean {
-        return prefs.getBoolean(KEY_PROTECTION_ENABLED, false)
-    }
-
-    fun setProtectionEnabled(enabled: Boolean) {
-        prefs.edit {
-            putBoolean(KEY_PROTECTION_ENABLED, enabled)
+            sharedStates[cacheKey] = current.failClosed()
+            try { stream?.let(file::failWrite) } catch (_: Exception) { /* Keep the fail-closed state. */ }
+            throw IOException("LOCKER_STORAGE_UNAVAILABLE")
         }
     }
 
-    private fun hashPin(pin: String, salt: ByteArray): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        digest.update(salt)
-        val hashBytes = digest.digest(pin.toByteArray(Charsets.UTF_8))
-        return Base64.encodeToString(hashBytes, Base64.NO_WRAP)
-    }
-
-    fun isBoardGuardLocked(): Boolean {
-        return prefs.getBoolean(KEY_BOARDGUARD_LOCKED, false)
-    }
-
-    fun setBoardGuardLocked(locked: Boolean) {
-        prefs.edit {
-            putBoolean(KEY_BOARDGUARD_LOCKED, locked)
+    private fun encryptionKey(create: Boolean): SecretKey {
+        val store = KeyStore.getInstance(KEYSTORE).apply { load(null) }
+        if (store.containsAlias(KEY_ALIAS)) {
+            return store.getKey(KEY_ALIAS, null) as? SecretKey ?: throw IOException("LOCKER_STORAGE_UNAVAILABLE")
         }
+        if (!create) throw IOException("LOCKER_STORAGE_UNAVAILABLE")
+        return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE).apply {
+            init(
+                KeyGenParameterSpec.Builder(KEY_ALIAS, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                    .setKeySize(256)
+                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                    .setUserAuthenticationRequired(false)
+                    .build()
+            )
+        }.generateKey()
     }
 
     companion object {
-        // TEST VALUES ONLY. Replace before deploying to schools.
-        // Four-digit shared hardcoded PINs can be extracted from the APK.
-        private const val RECOVERY_MASTER_PIN = "6179"
-        private const val ADMIN_MASTER_PIN = "8403"
-        private const val PREFS_NAME = "boardguard_prefs"
-        private const val KEY_PIN_HASH = "key_pin_hash"
-        private const val KEY_PIN_SALT = "key_pin_salt"
-        private const val KEY_PROTECTION_ENABLED = "key_protection_enabled"
-
-        private const val KEY_BOARDGUARD_LOCKED = "boardguard_locked"
+        private const val FILE_NAME = "locker_secure_snapshot_v1"
+        private const val KEYSTORE = "AndroidKeyStore"
+        private const val KEY_ALIAS = "locker_snapshot_aes_v1"
+        // Service, provider and lock Activity run in one app process and share this lock/cache.
+        // AtomicFile itself supplies no mutual exclusion.
+        private val storeLock = Any()
+        private val sharedStates = mutableMapOf<String, LockerSnapshot>()
     }
 }

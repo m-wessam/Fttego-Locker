@@ -2,6 +2,7 @@ package com.adowaalshamel.boardguard
 
 import android.app.ActivityManager
 import android.app.admin.DevicePolicyManager
+import android.content.Intent
 import android.os.Bundle
 import android.util.Log
 import android.view.WindowManager
@@ -17,22 +18,22 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
@@ -40,41 +41,63 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import com.adowaalshamel.boardguard.backend.LockerFailure
+import com.adowaalshamel.boardguard.backend.LockerRuntime
+import com.adowaalshamel.boardguard.backend.LockerUnlockResult
 import com.adowaalshamel.boardguard.ui.CustomNumericKeypad
 import com.adowaalshamel.boardguard.ui.PinInputBoxes
 import com.adowaalshamel.boardguard.ui.theme.BoardGuardTheme
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 /**
  * Full-screen secondary lock Activity.
- * Only a valid BoardGuard PIN clears the persisted lock state.
+ * Runtime validation or a synchronized disabled policy clears the persisted lock state.
  */
 class LockActivity : ComponentActivity() {
 
     private lateinit var pinStore: PinStore
+    private lateinit var runtime: LockerRuntime
+    private var exiting = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        pinStore = PinStore(this)
+        runtime = LockerRuntime.get(this)
+        pinStore = runtime.pinStore
         isLockActive = true
 
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
 
         if (!pinStore.isBoardGuardLocked()) {
             Log.w(TAG, "LockActivity opened while persisted lock state is false; closing")
-            isLockActive = false
-            finishAndRemoveTask()
+            exitIfUnlocked("opened_without_lock")
             return
         }
 
         BoardGuardDeviceAdminReceiver.setupLockTaskMode(this)
         ensureLockTaskMode()
 
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                runtime.policyRevision.collect {
+                    // A disabled policy has already been persisted atomically by the runtime.
+                    exitIfUnlocked("policy_updated")
+                }
+            }
+        }
+
         setContent {
             BoardGuardTheme {
                 LockScreenContent(
-                    onUnlockSuccess = { unlockAndExit() },
-                    verifyPin = { pin -> pinStore.verifyScreenPin(pin) }
+                    onUnlocked = { exitIfUnlocked("validation_completed") },
+                    verifyPin = runtime::verifyPin,
+                    remainingBlockSeconds = { pinStore.remainingBlockSeconds() }
                 )
             }
         }
@@ -82,13 +105,22 @@ class LockActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        isLockActive = true
+        isLockActive = !exiting
     }
 
     override fun onResume() {
         super.onResume()
+        if (exitIfUnlocked("resumed_without_lock")) return
         isLockActive = true
         ensureLockTaskMode()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (!exitIfUnlocked("new_intent_without_lock")) {
+            ensureLockTaskMode()
+        }
     }
 
     override fun onStop() {
@@ -114,6 +146,8 @@ class LockActivity : ComponentActivity() {
     }
 
     private fun ensureLockTaskMode() {
+        if (exiting || !pinStore.isBoardGuardLocked()) return
+
         if (!BoardGuardDeviceAdminReceiver.isDeviceOwner(this)) {
             Log.e(TAG, "Cannot enter Lock Task Mode because app is not Device Owner")
             return
@@ -141,9 +175,14 @@ class LockActivity : ComponentActivity() {
         }
     }
 
-    private fun unlockAndExit() {
-        pinStore.setBoardGuardLocked(false)
-        Log.i(TAG, "BOARDGUARD_UNLOCKED_BY_VALID_PIN")
+    private fun exitIfUnlocked(reason: String): Boolean {
+        if (exiting) return true
+        // The runtime owns the durable unlock. If a later event has already armed a
+        // new lock, an older request must not close this Activity or clear that lock.
+        if (pinStore.isBoardGuardLocked()) return false
+
+        exiting = true
+        Log.i(TAG, "BOARDGUARD_LOCK_CLOSED reason=$reason")
 
         try {
             stopLockTask()
@@ -153,6 +192,7 @@ class LockActivity : ComponentActivity() {
 
         isLockActive = false
         finishAndRemoveTask()
+        return true
     }
 
     private fun ensureMonitorServiceRunning() {
@@ -184,8 +224,9 @@ class LockActivity : ComponentActivity() {
 
 @Composable
 private fun LockScreenContent(
-    onUnlockSuccess: () -> Unit,
-    verifyPin: (String) -> Boolean
+    onUnlocked: () -> Unit,
+    verifyPin: suspend (String) -> LockerUnlockResult,
+    remainingBlockSeconds: () -> Long
 ) {
     // Intercept back button completely
     BackHandler(enabled = true) {
@@ -194,6 +235,24 @@ private fun LockScreenContent(
 
     var enteredPin by remember { mutableStateOf("") }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    var isVerifying by remember { mutableStateOf(false) }
+    var blockedSeconds by remember { mutableStateOf(remainingBlockSeconds()) }
+    val scope = rememberCoroutineScope()
+    val incorrectPassword = stringResource(R.string.incorrect_password)
+    val canEnterPin = !isVerifying && blockedSeconds == 0L
+
+    LaunchedEffect(Unit) {
+        while (isActive) {
+            blockedSeconds = remainingBlockSeconds()
+            delay(1_000L)
+        }
+    }
+
+    val statusMessage = when {
+        isVerifying -> "Checking password..."
+        blockedSeconds > 0L -> "Too many attempts. Try again in $blockedSeconds seconds."
+        else -> errorMessage
+    }
 
     Box(
         modifier = Modifier
@@ -236,15 +295,15 @@ private fun LockScreenContent(
                     PinInputBoxes(
                         pinValue = enteredPin,
                         onPinChange = {},
-                        isError = errorMessage != null,
+                        isError = errorMessage != null || blockedSeconds > 0L,
                         useSoftKeyboard = false
                     )
 
-                    if (errorMessage != null) {
+                    if (statusMessage != null) {
                         Spacer(modifier = Modifier.height(12.dp))
                         Text(
-                            text = errorMessage!!,
-                            color = MaterialTheme.colorScheme.error,
+                            text = statusMessage,
+                            color = if (isVerifying) Color(0xFF757575) else MaterialTheme.colorScheme.error,
                             fontSize = 14.sp,
                             fontWeight = FontWeight.Medium,
                             textAlign = TextAlign.Center
@@ -258,32 +317,60 @@ private fun LockScreenContent(
             // Large 3x4 Custom Keypad
             CustomNumericKeypad(
                 onDigitClick = { digit ->
-                    if (enteredPin.length < 4) {
+                    if (!isVerifying && blockedSeconds == 0L && enteredPin.length < 4) {
                         errorMessage = null
-                        val newPin = enteredPin + digit
-                        enteredPin = newPin
-
-                        // Auto-check on 4th digit option or require OK tap
+                        enteredPin += digit
                     }
                 },
                 onDeleteClick = {
-                    if (enteredPin.isNotEmpty()) {
+                    if (!isVerifying && blockedSeconds == 0L && enteredPin.isNotEmpty()) {
                         errorMessage = null
                         enteredPin = enteredPin.dropLast(1)
                     }
                 },
                 onOkClick = {
-                    if (enteredPin.length == 4) {
-                        if (verifyPin(enteredPin)) {
-                            onUnlockSuccess()
-                        } else {
-                            errorMessage = "Incorrect password"
-                            enteredPin = ""
+                    if (!isVerifying && blockedSeconds == 0L && enteredPin.length == 4) {
+                        val submittedPin = enteredPin
+                        isVerifying = true
+                        errorMessage = null
+                        scope.launch {
+                            try {
+                                when (val result = verifyPin(submittedPin)) {
+                                    LockerUnlockResult.Unlocked, LockerUnlockResult.Disabled -> onUnlocked()
+                                    LockerUnlockResult.Incorrect -> errorMessage = incorrectPassword
+                                    is LockerUnlockResult.Blocked -> {
+                                        blockedSeconds = maxOf(result.retryAfterSeconds, remainingBlockSeconds())
+                                    }
+                                    is LockerUnlockResult.Unavailable -> {
+                                        errorMessage = verificationFailureMessage(result.reason)
+                                    }
+                                }
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (_: Exception) {
+                                // Do not close the lock on an unexpected network/storage failure.
+                                errorMessage = "Unable to verify password. Please try again."
+                            } finally {
+                                enteredPin = ""
+                                isVerifying = false
+                            }
                         }
                     }
                 },
-                isOkEnabled = enteredPin.length == 4
+                isOkEnabled = canEnterPin && enteredPin.length == 4,
+                modifier = Modifier.alpha(if (canEnterPin) 1f else 0.5f)
             )
         }
     }
+}
+
+private fun verificationFailureMessage(reason: LockerFailure): String = when (reason) {
+    LockerFailure.NETWORK -> "Unable to verify password offline. Please reconnect and try again."
+    LockerFailure.SERVICE_UNAVAILABLE -> "Password verification is temporarily unavailable. Please try again."
+    LockerFailure.RATE_LIMITED -> "Please wait before trying again."
+    LockerFailure.AUTHORIZATION, LockerFailure.NOT_REGISTERED ->
+        "Screen registration needs attention. Please contact the administrator."
+    LockerFailure.INVALID_CLOCK -> "Check the screen date and time, then try again."
+    LockerFailure.STORAGE -> "Unable to save the unlock. Please try again."
+    LockerFailure.INVALID_RESPONSE, LockerFailure.UNKNOWN -> "Unable to verify password. Please try again."
 }
